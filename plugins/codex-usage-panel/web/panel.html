@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex 额度面板</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; color: #1b242b; background: #f5f7f8; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; }
+  main { max-width: 560px; margin: auto; }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 18px; margin: 0 0 5px; font-weight: 650; letter-spacing: -.4px; }
+  small, .muted { color: #68767d; font-size: 12px; }
+  .live { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 6px; height: 6px; background: #16866f; border-radius: 100%; }
+  button { border: 1px solid #d9e0e3; background: transparent; border-radius: 9px; padding: 7px 10px; color: inherit; cursor: pointer; font: inherit; font-size: 12px; }
+  button:hover { background: #e7edef; }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; gap: 6px; }
+  .card { border: 1px solid #e1e6e9; background: #fff; border-radius: 14px; padding: 18px; margin-bottom: 12px; }
+  .top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .label { font-size: 13px; font-weight: 600; }
+  .amount { font-size: 32px; font-weight: 650; letter-spacing: -1.5px; font-variant-numeric: tabular-nums; }
+  .amount span { font-size: 14px; font-weight: 450; letter-spacing: 0; color: #68767d; margin-left: 5px; }
+  .track { height: 6px; background: #eaf0f2; border-radius: 8px; margin: 13px 0 12px; overflow: hidden; }
+  .fill { height: 100%; background: #16866f; border-radius: inherit; }
+  .fill.low { background: #d17a20; }
+  .fill.empty { background: #ce4949; }
+  .foot { display: flex; flex-wrap: wrap; gap: 7px 14px; justify-content: space-between; font-size: 12px; color: #68767d; line-height: 1.6; }
+  #message { font-size: 13px; line-height: 1.7; padding: 14px 0; }
+  footer { font-size: 11px; line-height: 1.8; color: #68767d; margin-top: 16px; }
+  #status { display: block; }
+  #message:empty { display: none; }
+  @media (prefers-color-scheme: dark) {
+    :root { color: #e4ebef; background: #161a1d; }
+    .card { background: #20262a; border-color: #323b41; }
+    button { border-color: #3a464e; }
+    button:hover { background: #2d363d; }
+    small, .muted, .foot, footer, .amount span { color: #9baab3; }
+    .track { background: #354047; }
+    .fill { background: #50b49a; }
+  }
+  @media (max-width: 340px) { body { padding: 12px; } header { flex-wrap: wrap; } .amount { font-size: 28px; } }
+</style>
+<main>
+  <header>
+    <div><h1>剩余额度</h1><small class="live"><span class="dot" id="dot"></span><span id="mode">正在连接</span></small></div>
+    <div class="actions"><button id="pip" hidden>悬浮显示</button><button id="refresh">刷新</button></div>
+  </header>
+  <section id="rows" aria-label="额度窗口"></section>
+  <div id="message" role="status">正在读取本机 Codex 额度…</div>
+  <footer><span id="status">等待首次更新</span><span>本机已登录账号 · 每 30 秒自动刷新</span><br>账号额度由所有聊天共享；此处不表示当前聊天的剩余上下文。</footer>
+</main>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const local = /^https?:$/.test(location.protocol) && ["127.0.0.1", "localhost"].includes(location.hostname);
+  let sequence = 0, current = null, busy = false, ready = false, failures = 0;
+  const pending = new Map();
+  function rpc(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = ++sequence;
+      const timeout = setTimeout(() => { pending.delete(id); reject(new Error("插件响应超时")); }, 35000);
+      pending.set(id, { resolve, reject, timeout });
+      window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+    });
+  }
+  function notify(method, params) { window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*"); }
+  function showError(text) {
+    current = null;
+    $("rows").replaceChildren();
+    $("message").textContent = text;
+    $("mode").textContent = "数据暂不可用";
+    $("dot").style.background = "#d17a20";
+  }
+  function windowLabel(minutes) {
+    if (!Number.isFinite(minutes)) return "额度窗口";
+    if (minutes === 300) return "5 小时";
+    if (minutes === 10080) return "每周";
+    if (minutes >= 1440 && minutes % 1440 === 0) return (minutes / 1440) + " 天";
+    if (minutes >= 60 && minutes % 60 === 0) return (minutes / 60) + " 小时";
+    return minutes + " 分钟";
+  }
+  function element(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+  function render(snapshot) {
+    if (!snapshot || !snapshot.ok) { showError(snapshot && snapshot.error || "账号暂无可用额度数据。"); return; }
+    current = snapshot;
+    const nodes = snapshot.rows.map((row) => {
+      const card = element("article", "card");
+      const top = element("div", "top");
+      const label = element("div", "label", windowLabel(row.windowMinutes));
+      if (row.limitName && row.limitName !== "codex") label.append(element("div", "muted", row.limitName));
+      const known = Number.isFinite(row.remainingPercent);
+      const value = known ? Math.max(0, Math.min(100, row.remainingPercent)) : null;
+      const amount = element("div", "amount", known ? new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(value) + "%" : "—");
+      amount.append(element("span", "", "剩余"));
+      top.append(label, amount);
+      const track = element("div", "track");
+      const fill = element("div", "fill" + (known && value <= 0 ? " empty" : known && value <= 20 ? " low" : ""));
+      fill.style.width = (value || 0) + "%";
+      track.setAttribute("role", "meter");
+      track.setAttribute("aria-label", windowLabel(row.windowMinutes) + "剩余额度");
+      track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100");
+      if (known) track.setAttribute("aria-valuenow", String(value));
+      track.append(fill);
+      const foot = element("div", "foot");
+      const reset = row.resetsAt;
+      let when = "重置时间未知";
+      if (Number.isFinite(reset)) when = reset * 1000 <= Date.now() ? "重置时间已到，等待服务端更新" : new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(reset * 1000)) + " 重置";
+      foot.append(element("span", "", when));
+      card.append(top, track, foot);
+      return card;
+    });
+    $("rows").replaceChildren(...nodes);
+    $("message").textContent = "";
+    $("dot").style.background = "";
+    $("mode").textContent = "自动更新";
+    const fetchedAt = snapshot.fetchedAt * 1000;
+    $("status").textContent = "更新于 " + new Date(fetchedAt).toLocaleTimeString("zh-CN", { hour12: false });
+  }
+  function accept(result) {
+    const snapshot = result && (result.structuredContent || result);
+    if (snapshot && typeof snapshot.ok === "boolean") render(snapshot);
+  }
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent || !event.data || event.data.jsonrpc !== "2.0") return;
+    const message = event.data;
+    if (message.id !== undefined && pending.has(message.id)) {
+      const item = pending.get(message.id); pending.delete(message.id); clearTimeout(item.timeout);
+      if (message.error) item.reject(new Error(message.error.message || "宿主请求失败")); else item.resolve(message.result);
+    } else if (message.method === "ui/notifications/tool-result") {
+      accept(message.params);
+    } else if (message.method === "ui/resource-teardown") {
+      ready = false;
+      clearInterval(timer);
+      window.parent.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*");
+    }
+  });
+  async function refresh() {
+    if (busy || !ready) return;
+    busy = true; $("refresh").disabled = true;
+    try {
+      if (local) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 35000);
+        try {
+          const response = await fetch("/api/usage", { cache: "no-store", signal: controller.signal });
+          if (!response.ok) throw new Error("本机额度服务暂不可用");
+          accept(await response.json());
+        } finally { clearTimeout(timeout); }
+      } else {
+        accept(await rpc("tools/call", { name: "get_usage", arguments: {} }));
+      }
+      failures = 0;
+    } catch (_) {
+      failures++;
+      showError("无法刷新额度，请检查本机 Codex 登录状态及插件连接。将自动重试。");
+    } finally { busy = false; $("refresh").disabled = false; }
+  }
+  $("refresh").onclick = refresh;
+  $("pip").onclick = async () => {
+    try { await window.openai.requestDisplayMode({ mode: "pip" }); }
+    catch (_) { $("message").textContent = "当前宿主未提供悬浮模式，可将面板保持在侧栏。"; }
+  };
+  const timer = setInterval(() => {
+    if (current && Date.now() - current.fetchedAt * 1000 > 90000) {
+      $("mode").textContent = "数据已过期";
+      $("dot").style.background = "#d17a20";
+    }
+    // Back off after repeated connection failures while keeping the panel usable.
+    if (failures < 3 || failures % 4 === 0) refresh(); else failures++;
+  }, 30000);
+  async function start() {
+    if (!local) {
+      await rpc("ui/initialize", { appInfo: { name: "codex-usage-panel", version: "0.1.0" },
+        appCapabilities: { availableDisplayModes: ["inline", "pip", "fullscreen"] }, protocolVersion: "2026-01-26" });
+      notify("ui/notifications/initialized", {});
+      if (window.openai && typeof window.openai.requestDisplayMode === "function") $("pip").hidden = false;
+    }
+    ready = true;
+    await refresh();
+  }
+  start().catch(() => showError("无法连接插件界面桥接，请重新打开额度面板，或使用插件提供的本机面板地址。"));
+})();
+</script>
+</html>

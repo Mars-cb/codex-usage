@@ -1,0 +1,10 @@
+{
+  "name": "local-usage-tools",
+  "interface": {"displayName": "本机额度工具"},
+  "plugins": [{
+    "name": "codex-usage-panel",
+    "source": {"source": "local", "path": "./plugins/codex-usage-panel"},
+    "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+    "category": "Productivity"
+  }]
+}
